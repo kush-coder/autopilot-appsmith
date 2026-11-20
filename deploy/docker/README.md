@@ -1,0 +1,276 @@
+# Appsmith Docker Image
+
+The Appsmith Docker image is built with all the components required for it to run, within a single Docker container. Files in this directory make up for the scripts and template files needed for building the image.
+
+You may choose to use the Appsmith cloud instance (at [app.appsmith.com](https://app.appsmith.com)) or start your own using this image.
+
+## Appsmith Cloud
+
+The fastest way to get started with appsmith is using our cloud-hosted version. It's as easy as
+
+1. [Create an Account](https://app.appsmith.com/user/signup)
+2. [Docs on Building a UI](https://docs.appsmith.com/core-concepts/dynamic-ui)
+
+## Self Host
+
+The following subsections describe how you can get started with _your own_ instance of Appsmith.
+
+### 1. Prerequisites
+
+Ensure `docker` and `docker-compose` are installed and available for starting containers:
+
+- Install Docker: [https://docs.docker.com/engine/install/](https://docs.docker.com/engine/install/)
+- Install Docker Compose: [https://docs.docker.com/compose/install/](https://docs.docker.com/compose/install/)
+
+You may verify the installation by running `docker --version` and `docker-compose --version`. The output should roughly be something like below:
+
+```sh
+$ docker --version
+Docker version 20.10.7, build f0df350
+$ docker-compose --version
+docker-compose version 1.29.2, build 5becea4c
+```
+
+### 2. Docker compose configuration
+
+Create a folder called `appsmith` (or some other name that you like), which will serve as our installation folder. Inside this folder, create a `docker-compose.yml` file and copy the following content into it:
+
+```yaml
+version: "3"
+
+services:
+  appsmith:
+    image: appsmith/appsmith-ce
+    container_name: appsmith-ce
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./stacks:/appsmith-stacks
+    restart: unless-stopped
+  #   # Uncomment the lines below to enable auto-update
+  #   labels:
+  #     com.centurylinklabs.watchtower.enable: "true"
+
+  # auto_update:
+  #   image: containrrr/watchtower
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   # Update check interval in seconds.
+  #   command: --schedule "0 0 * ? * *" --label-enable --cleanup
+  #   restart: unless-stopped
+
+
+```
+>>Note: To enable auto-update for Appsmith, please uncomment all the commented lines in the docker-compose file.
+
+After saving this file, `cd` to the folder that contains this file and run the following command to start Appsmith:
+
+```sh
+docker-compose up -d
+```
+
+This command may take a few minutes to download the docker image and initialize the application. Appsmith should soon be available at <http://localhost>.
+
+You can check if application is running correctly by running `docker ps` or `docker-compose ps` (running `docker-compose` will require you to be in the directory containing the `docker-compose.yml` file to work).
+
+```sh
+$ docker ps
+CONTAINER ID        IMAGE                             COMMAND                  CREATED             STATUS              PORTS                                      NAMES
+3b8f2c9638d0        appsmith/appsmith          "/opt/appsmith/entrypoint.sh"   17 minutes ago      Up 17 minutes       0.0.0.0:80->80/tcp, 0.0.0.0:443->443/tcp   appsmith
+```
+
+You can also use the Supervisord UI to monitor and manage the different processes _inside_ the container. This is discussed [further below](#supervisord).
+
+## Custom Domain
+
+To make Appsmith available on a custom domain, please update your domain's DNS records to point to the instance running Appsmith. Most domain registrars / DNS-providers have documentation on how you can do this yourself.
+
+* [GoDaddy](https://in.godaddy.com/help/create-a-subdomain-4080)
+* [Amazon Route 53](https://aws.amazon.com/premiumsupport/knowledge-center/create-subdomain-route-53/)
+* [Digital Ocean](https://www.digitalocean.com/docs/networking/dns/how-to/add-subdomain/)
+* [NameCheap](https://www.namecheap.com/support/knowledgebase/article.aspx/9776/2237/how-to-create-a-subdomain-for-my-domain)
+* [Domain.com](https://www.domain.com/help/article/domain-management-how-to-update-subdomains)
+
+## Custom SSL Certificate
+
+In our container, we support to generate a free SSL certificate If you have your owned certificate, please follow these steps to use it inside the container.
+- Firstly, please rename your certificate file as `fullchain.pem` and key file as `privkey.pem`
+- Then, copy these files into the sub-directory `<mounting-directory>/ssl/` (*Note: Please change `<mounting-directory>` by the mounting volume directory in the `docker-compose.yml`. Default is `./stacks`*)
+- Restart the container using `docker restart appsmith`
+
+The container will check the certificate files in the folder `<mounting-directory>/ssl` and use them if they are existed.
+
+*Note: In case of the certificate files have different name from `fullchain.pem` and `privkey.pem`, it will be considered as missing custom certificate and auto-provisioning the certificate by Let's Encrypt*
+## Environment configuration format
+
+`/appsmith-stacks/configuration/docker.env` contains data, not a shell script.
+Use one `NAME=value` assignment per line. Empty values, single and double quotes,
+and concatenated quoted segments are supported. Single quotes preserve their
+contents literally. Outside single quotes, backslashes escape the next character
+(inside double quotes, only backslash, double quote, dollar sign, and backtick).
+Blank lines and full-line comments are ignored. Unquoted, unescaped trailing
+spaces and tabs are ignored and may be followed by an inline `#` comment.
+Quoted or escaped spaces remain part of the value, and `NAME=#abc` preserves
+`#abc`. Quote values containing spaces. Duplicate
+assignments use the last value. LF and CRLF line endings are accepted.
+
+Supported names start with `APPSMITH_`, `MONGO_`, `KEYCLOAK_`, or `OTEL_` and contain
+only letters, digits, and underscores. The prefixes remain case-sensitive.
+`OTEL_*` values reach every service; the Java server honors only the normalized
+trace endpoint and sampling probability from them.
+`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` and their lowercase equivalents are supported,
+as are `NEW_RELIC_LICENSE_KEY`, `NEW_RELIC_APP_NAME`,
+`JGROUPS_DISCOVERY_PROTOCOL`, `FILESTORE_IP_ADDRESS`, `FILE_SHARE_NAME`, and `PORT`.
+Other names are rejected rather than silently ignored. Shell control variables such
+as `PATH`, `BASH_ENV`, and `LD_PRELOAD` cannot be set through this file.
+
+JVM-control variables are deployment-only: `APPSMITH_JAVA_ARGS`,
+`APPSMITH_JAVA_HEAP_ARG`, `JAVA_OPTS`, `JAVA_OPTS_APPEND`, `JAVA_TOOL_OPTIONS`,
+`JDK_JAVA_OPTIONS`, and `_JAVA_OPTIONS`. Assignments to these names in `docker.env`
+are ignored without evaluating their contents. Nonempty assignments produce a
+warning naming the variable, never its value:
+
+```text
+Ignoring APPSMITH_JAVA_ARGS in docker.env: JVM options must be configured through the container environment (Docker Compose or Helm).
+```
+
+Set JVM options through the container environment in Docker Compose or Helm.
+Deployment-supplied values, including explicitly empty values, are preserved in
+the private restart snapshot. Generated internal JVM options remain supported.
+
+Variable references such as `${PASSWORD}`, commands such as `$(command)`, backticks,
+and semicolons are never evaluated. Unescaped expressions that would require shell
+expansion (including inside double quotes) stop startup with a migration error.
+Supply fully resolved configuration values. Single-quote intentional literal
+expressions, for example `APPSMITH_ENCRYPTION_PASSWORD='literal$(text)'`.
+Malformed assignments, unsupported names, control characters, and unterminated
+quotes stop startup with the line number and, when recognizable, the variable
+name, without printing its value. Quoted multiline values in
+`docker.env` are not supported.
+
+External `APPSMITH_*`, `MONGO_*`, and `OTEL_*` environment variables override this file,
+including explicitly empty values. Their values are saved verbatim in a private
+JSON snapshot for service restarts; quotes, newlines, and non-UTF-8 bytes are preserved. Kubernetes
+Secrets and Vault values that are already resolved before container startup do
+not require shell evaluation.
+
+### Impact on existing instances
+
+Fresh installs and upgrades using generated defaults or Admin Settings values
+require no configuration changes. Before upgrading a customized installation,
+replace shell expressions in `docker.env` with their intended literal values and
+remove shell commands or unsupported variable names. Do not source a potentially
+compromised file to perform this conversion.
+Move any JVM-control assignments from `docker.env` to the container environment
+before upgrading, then recreate the container or roll out the pod. A service-only
+restart does not refresh deployment configuration.
+
+Preserve the effective encryption password and salt exactly. Changing either can
+make existing encrypted credentials unreadable. Obtain their resolved values from
+a trusted secret store or the running instance before upgrade; do not replace
+an expression with its literal text unless that was already the intended value.
+
+Backup and restore use the same parser to validate configuration and quote literal
+values. Restore validates before stopping services or restoring the database, and
+replaces the environment file atomically. Incompatible legacy backups must be
+corrected before restore. Serialized backups and restored configuration omit
+JVM-control assignments; configure those separately on the target deployment.
+Persisted configuration uses UTF-8 and cannot contain
+multiline values. Backup/restore reject multiline replacement values rather than
+changing them. Tabs are supported; other control characters are not. The external
+snapshot's byte preservation does not guarantee that individual application
+runtimes support non-UTF-8 credentials; use UTF-8 for portable configuration.
+
+The loader does not sanitize or rewrite the persistent file. Rolling back to an
+older image restores that image's shell evaluation behavior, so inspect the file
+before rollback. Removing configuration evaluation prevents stored commands from
+running through this path; it does not recover an already compromised instance.
+
+## Instance Management Utilities
+
+The image includes an `appsmithctl` command to help with the management and maintenance of your instance. The following subsections describe what's available.
+
+### Export database
+
+The following command can be used to take a backup dump of Appsmith's database. This can be restored onto another instance using the import command (discussed below) to restore all data.
+
+Before running this, ensure you are in the directory where `docker-compose.yml` is located.
+
+```sh
+docker-compose exec appsmith-ce appsmithctl export_db
+```
+
+The output file will be stored in the container directory `/appsmith-stacks/data/backup/appsmith-data.archive`. Thanks to the volume configuration in the `docker-compose.yml` file, it should be available on your host machine at `./stacks/data/backup/appsmith-data.archive`.
+
+If your volume configuration is different or unavailable, you can use the following command to copy the archive file to your host disk:
+
+```sh
+docker-compose cp appsmith-ce:/appsmith-stacks/data/backup/appsmith-data.archive .
+```
+
+Note that you may want to save the `docker.env` file in addition to this archive file, if you intend to be able to reproduce this environment elsewhere, or in case of a disaster. This file can be copied out of the container with the following command:
+
+```sh
+docker-compose cp appsmith-ce:/appsmith-stacks/configuration/docker.env .
+```
+
+**Be sure to keep this file safe**, since it contains information that can be used to decrypt datasource information from the database archive.
+
+### Import database
+
+The following command can restore backup archive, that was produced by the export command (discussed above).
+
+First, copy the archive file into the container using the following command:
+
+```sh
+docker-compose cp ./appsmith-data.archive appsmith-ce:/appsmith-stacks/data/restore/
+```
+
+Second, run the following command to import data from this file:
+
+```sh
+docker-compose exec appsmith-ce appsmithctl import_db
+```
+
+Note that when you restore, you may also want to copy a `docker.env` from the original instance into this one. You can use the following command to do this (assuming you are in the installation folder and `docker.env` exists in the same folder):
+
+```sh
+docker-compose cp ./docker.env appsmith-ce:/appsmith-stacks/configuration/
+```
+
+This will need a restart of the Appsmith server, which can be done using the following command:
+
+```sh
+docker-compose exec appsmith-ce supervisorctl restart backend
+```
+
+## Supervisor
+
+The container runs multiple processes, including the Appsmith server, Caddy, MongoDB etc., inside a single Docker container. These processes are started and managed by [supervisord](http://supervisord.org/).
+
+Supervisord comes with a web interface for managing the various processes, available at <http://localhost/supervisor/>, as well as a command line interface towards the same goal.
+
+Here's a screenshot of the web interface listing all the processes managed:
+
+<p>
+  <img src="https://raw.githubusercontent.com/appsmithorg/appsmith/release/deploy/docker/images/appsmith_supervisord_ui.png" width="80%">
+</p>
+
+The command line interface can also be used to perform operations like restarting the Appsmith server, or restarting Caddy etc. For example, the following command (run in the installation folder) can be used to get a status of all running processes:
+
+```sh
+docker-compose exec appsmith-ce supervisorctl status
+```
+
+Or to view the last few lines of stderr output of one of the processes:
+
+```sh
+docker-compose exec appsmith-ce supervisorctl tail backend stderr
+```
+
+To learn more, please refer to [Supervisor's documentation](http://supervisord.org/running.html#supervisorctl-actions) on what actions are available to be performed by the command line interface.
+
+## Troubleshooting
+
+If you encounter any errors during this process, please reach out to [**support@appsmith.com**](mailto:support@appsmith.com) or join our [Discord Server](https://discord.com/invite/rBTTVJp) and reach out on the #support channel.

@@ -1,0 +1,1410 @@
+package com.external.plugins;
+
+import com.appsmith.external.dtos.ExecuteActionDTO;
+import com.appsmith.external.dtos.MultipartFormDataDTO;
+import com.appsmith.external.exceptions.pluginExceptions.AppsmithPluginError;
+import com.appsmith.external.exceptions.pluginExceptions.AppsmithPluginException;
+import com.appsmith.external.exceptions.pluginExceptions.StaleConnectionException;
+import com.appsmith.external.helpers.DataTypeStringUtils;
+import com.appsmith.external.helpers.MustacheHelper;
+import com.appsmith.external.models.ActionConfiguration;
+import com.appsmith.external.models.ActionExecutionRequest;
+import com.appsmith.external.models.ActionExecutionResult;
+import com.appsmith.external.models.Condition;
+import com.appsmith.external.models.DBAuth;
+import com.appsmith.external.models.DatasourceConfiguration;
+import com.appsmith.external.models.DatasourceStructure;
+import com.appsmith.external.models.DatasourceTestResult;
+import com.appsmith.external.models.MustacheBindingToken;
+import com.appsmith.external.models.Param;
+import com.appsmith.external.models.Property;
+import com.appsmith.external.models.RequestParamDTO;
+import com.appsmith.external.models.UQIDataFilterParams;
+import com.appsmith.external.plugins.BasePlugin;
+import com.appsmith.external.plugins.PluginExecutor;
+import com.appsmith.external.plugins.SmartSubstitutionInterface;
+import com.appsmith.external.services.FilterDataService;
+import com.external.plugins.constants.AmazonS3Action;
+import com.external.plugins.exceptions.S3ErrorMessages;
+import com.external.plugins.exceptions.S3PluginError;
+import com.external.utils.AmazonS3ErrorUtils;
+import com.external.utils.S3Connection;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import lombok.extern.slf4j.Slf4j;
+import org.pf4j.Extension;
+import org.pf4j.PluginWrapper;
+import org.pf4j.util.StringUtils;
+import org.springframework.util.CollectionUtils;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
+import software.amazon.awssdk.awscore.exception.AwsErrorDetails;
+import software.amazon.awssdk.awscore.exception.AwsServiceException;
+import software.amazon.awssdk.core.exception.SdkException;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.http.ContentStreamProvider;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.Bucket;
+import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.CompletedMultipartUpload;
+import software.amazon.awssdk.services.s3.model.CompletedPart;
+import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.Delete;
+import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
+import software.amazon.awssdk.services.s3.model.DeleteObjectsRequest;
+import software.amazon.awssdk.services.s3.model.DeleteObjectsResponse;
+import software.amazon.awssdk.services.s3.model.EncodingType;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.ListObjectsRequest;
+import software.amazon.awssdk.services.s3.model.ListObjectsResponse;
+import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.model.S3Error;
+import software.amazon.awssdk.services.s3.model.S3Object;
+import software.amazon.awssdk.services.s3.model.UploadPartRequest;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import static com.appsmith.external.constants.ActionConstants.ACTION_CONFIGURATION_BODY;
+import static com.appsmith.external.constants.ActionConstants.ACTION_CONFIGURATION_PATH;
+import static com.appsmith.external.exceptions.pluginExceptions.BasePluginErrorMessages.CONNECTION_NULL_ERROR_MSG;
+import static com.appsmith.external.helpers.PluginUtils.OBJECT_TYPE;
+import static com.appsmith.external.helpers.PluginUtils.STRING_TYPE;
+import static com.appsmith.external.helpers.PluginUtils.getDataValueSafelyFromFormData;
+import static com.appsmith.external.helpers.PluginUtils.parseList;
+import static com.appsmith.external.helpers.PluginUtils.parseWhereClause;
+import static com.appsmith.external.helpers.PluginUtils.setDataValueSafelyInFormData;
+import static com.external.plugins.constants.FieldName.BODY;
+import static com.external.plugins.constants.FieldName.BUCKET;
+import static com.external.plugins.constants.FieldName.COMMAND;
+import static com.external.plugins.constants.FieldName.CREATE_DATATYPE;
+import static com.external.plugins.constants.FieldName.CREATE_EXPIRY;
+import static com.external.plugins.constants.FieldName.KEY_BUCKET;
+import static com.external.plugins.constants.FieldName.KEY_DATA;
+import static com.external.plugins.constants.FieldName.LIST_EXPIRY;
+import static com.external.plugins.constants.FieldName.LIST_PAGINATE;
+import static com.external.plugins.constants.FieldName.LIST_PREFIX;
+import static com.external.plugins.constants.FieldName.LIST_SIGNED_URL;
+import static com.external.plugins.constants.FieldName.LIST_SORT;
+import static com.external.plugins.constants.FieldName.LIST_UNSIGNED_URL;
+import static com.external.plugins.constants.FieldName.LIST_WHERE;
+import static com.external.plugins.constants.FieldName.PATH;
+import static com.external.plugins.constants.FieldName.READ_DATATYPE;
+import static com.external.plugins.constants.FieldName.SMART_SUBSTITUTION;
+import static com.external.plugins.constants.S3PluginConstants.ACCESS_DENIED_ERROR_CODE;
+import static com.external.plugins.constants.S3PluginConstants.AWS_S3_SERVICE_PROVIDER;
+import static com.external.plugins.constants.S3PluginConstants.BASE64_DELIMITER;
+import static com.external.plugins.constants.S3PluginConstants.CUSTOM_ENDPOINT_INDEX;
+import static com.external.plugins.constants.S3PluginConstants.DEFAULT_BUCKET_PROPERTY_INDEX;
+import static com.external.plugins.constants.S3PluginConstants.DEFAULT_FILE_NAME;
+import static com.external.plugins.constants.S3PluginConstants.DEFAULT_URL_EXPIRY_IN_MINUTES;
+import static com.external.plugins.constants.S3PluginConstants.GOOGLE_CLOUD_SERVICE_PROVIDER;
+import static com.external.plugins.constants.S3PluginConstants.NO;
+import static com.external.plugins.constants.S3PluginConstants.S3_DRIVER;
+import static com.external.plugins.constants.S3PluginConstants.S3_SERVICE_PROVIDER_PROPERTY_INDEX;
+import static com.external.plugins.constants.S3PluginConstants.YES;
+import static com.external.utils.DatasourceUtils.createConnection;
+import static com.external.utils.TemplateUtils.getTemplates;
+import static java.lang.Boolean.TRUE;
+import static org.apache.commons.collections.CollectionUtils.isEmpty;
+
+@Slf4j
+public class AmazonS3Plugin extends BasePlugin {
+
+    public AmazonS3Plugin(PluginWrapper wrapper) {
+        super(wrapper);
+    }
+
+    @Extension
+    public static class S3PluginExecutor implements PluginExecutor<S3Connection>, SmartSubstitutionInterface {
+
+        /** Shortest validity a presigned URL can be signed for. */
+        private static final Duration MINIMUM_PRESIGNED_URL_VALIDITY = Duration.ofSeconds(1);
+
+        /** Content type of an upload whose body does not name one. */
+        private static final String DEFAULT_UPLOAD_CONTENT_TYPE = "application/octet-stream";
+
+        /**
+         * Largest upload sent as one PutObject. Larger ones are multipart uploads, so that a failed request resends one
+         * part rather than the whole object.
+         */
+        private static final long MULTIPART_UPLOAD_THRESHOLD = 16L * 1024 * 1024;
+
+        /** Smallest size S3 accepts for every part of a multipart upload but the last. */
+        private static final long MINIMUM_UPLOAD_PART_SIZE = 5L * 1024 * 1024;
+
+        /**
+         * Most parts S3 accepts in one multipart upload. Parts grow beyond the minimum size only for payloads above
+         * about 48 GiB, which a byte array cannot hold; the limit guards the part size calculation all the same.
+         */
+        private static final long MAXIMUM_UPLOAD_PARTS = 10_000;
+
+        /** Start of the error detail of a bulk delete that reports per-key errors in its response. */
+        private static final String BULK_DELETE_ERRORS_MESSAGE = "One or more objects could not be deleted";
+
+        /** Most objects the error detail of a bulk delete names; the others are counted. */
+        private static final int MAX_BULK_DELETE_ERRORS_NAMED = 10;
+
+        /** Most characters of a service message the error detail of a bulk delete repeats for one object. */
+        private static final int MAX_BULK_DELETE_ERROR_MESSAGE_LENGTH = 200;
+
+        private final Scheduler scheduler = Schedulers.boundedElastic();
+        private final FilterDataService filterDataService;
+        private static final AmazonS3ErrorUtils amazonS3ErrorUtils;
+
+        static {
+            try {
+                amazonS3ErrorUtils = AmazonS3ErrorUtils.getInstance();
+            } catch (InstantiationException e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+        public S3PluginExecutor() {
+            this.filterDataService = FilterDataService.getInstance();
+        }
+
+        /*
+         * - Exception thrown by this method is expected to be handled by the caller.
+         */
+        ArrayList<String> getFilenamesFromObjectListing(ListObjectsResponse objectListing)
+                throws AppsmithPluginException {
+            if (objectListing == null) {
+                throw new AppsmithPluginException(
+                        S3PluginError.AMAZON_S3_QUERY_EXECUTION_FAILED,
+                        S3ErrorMessages.FILE_CONTENT_FETCHING_ERROR_MSG);
+            }
+
+            ArrayList<String> result = new ArrayList<>();
+            List<S3Object> objects = objectListing.contents();
+            for (S3Object os : objects) {
+                result.add(os.key());
+            }
+
+            return result;
+        }
+
+        /*
+         * - Exception thrown by this method is expected to be handled by the caller.
+         */
+        ArrayList<String> listAllFilesInBucket(S3Connection connection, String bucketName, String prefix)
+                throws AppsmithPluginException {
+            if (connection == null) {
+                throw new AppsmithPluginException(
+                        AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR, S3ErrorMessages.CONNECTIVITY_ERROR_MSG);
+            }
+
+            if (bucketName == null) {
+                /*
+                 * - bucketName is NOT expected to be null at this program point. A null check has been added in the
+                 *  execute function already.
+                 */
+                throw new AppsmithPluginException(
+                        AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR, S3ErrorMessages.EMPTY_BUCKET_ERROR_MSG);
+            }
+
+            if (prefix == null) {
+                /*
+                 * - prefix is NOT expected to be null at this program point. A null check has been added in the
+                 *  execute function already.
+                 */
+                throw new AppsmithPluginException(
+                        AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR, S3ErrorMessages.EMPTY_PREFIX_ERROR_MSG);
+            }
+
+            // Keys are requested URL-encoded so that keys with characters XML cannot carry are listed; the SDK decodes
+            // them in the response.
+            ListObjectsResponse result = connection
+                    .client()
+                    .listObjects(ListObjectsRequest.builder()
+                            .bucket(bucketName)
+                            .prefix(prefix)
+                            .encodingType(EncodingType.URL)
+                            .build());
+            ArrayList<String> fileList = new ArrayList<>(getFilenamesFromObjectListing(result));
+
+            while (Boolean.TRUE.equals(result.isTruncated())) {
+                result = connection.client().listObjects(nextBatchOfObjectsRequest(bucketName, result));
+                fileList.addAll(getFilenamesFromObjectListing(result));
+            }
+
+            return fileList;
+        }
+
+        /**
+         * The request for the page after a truncated listing: it repeats the listing's prefix, page size and encoding
+         * as the service echoed them, and starts after the listing's next marker. The service sends a next marker only
+         * when a delimiter is used; otherwise the last key listed is the marker.
+         */
+        private static ListObjectsRequest nextBatchOfObjectsRequest(String bucketName, ListObjectsResponse previous) {
+            String marker = previous.nextMarker();
+            if (marker == null && !previous.contents().isEmpty()) {
+                marker = previous.contents().get(previous.contents().size() - 1).key();
+            }
+            return ListObjectsRequest.builder()
+                    .bucket(bucketName)
+                    .prefix(emptyToNull(previous.prefix()))
+                    .maxKeys(previous.maxKeys())
+                    .encodingType(previous.encodingType())
+                    .marker(marker)
+                    .build();
+        }
+
+        private static String emptyToNull(String value) {
+            return value == null || value.isEmpty() ? null : value;
+        }
+
+        /**
+         * Presigned GET URLs that stop being valid at {@code expiryDateTime}. Each URL is valid from the moment it is
+         * signed until that instant, and for at least {@link #MINIMUM_PRESIGNED_URL_VALIDITY}.
+         */
+        ArrayList<String> getSignedUrls(
+                S3Connection connection, String bucketName, ArrayList<String> listOfFiles, Date expiryDateTime) {
+            return new ArrayList<>(connection.presignedGetUrls(bucketName, listOfFiles, () -> {
+                Duration validFor = Duration.between(Instant.now(), expiryDateTime.toInstant());
+                return validFor.compareTo(MINIMUM_PRESIGNED_URL_VALIDITY) < 0
+                        ? MINIMUM_PRESIGNED_URL_VALIDITY
+                        : validFor;
+            }));
+        }
+
+        /**
+         * This function returns the unsigned file urls for the files present in the body
+         */
+        ArrayList<String> createFileUrlsFromBody(S3Connection connection, String bucketName, String path, String body)
+                throws AppsmithPluginException {
+            List<MultipartFormDataDTO> multipartFormDataDTOs;
+            ArrayList<String> urlList = new ArrayList<>();
+            try {
+                multipartFormDataDTOs = Arrays.asList(objectMapper.readValue(body, MultipartFormDataDTO[].class));
+            } catch (IOException e) {
+                throw new AppsmithPluginException(
+                        AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                        S3ErrorMessages.UNPARSABLE_CONTENT_ERROR_MSG,
+                        e.getMessage());
+            }
+            multipartFormDataDTOs.forEach(multipartFormDataDTO -> {
+                final String filePath = path + multipartFormDataDTO.getName();
+
+                urlList.add(connection.unsignedUrl(bucketName, filePath));
+            });
+            return urlList;
+        }
+
+        /**
+         * This function returns the unsigned file url for the file path
+         */
+        String createFileUrl(S3Connection connection, String bucketName, String path) {
+            return connection.unsignedUrl(bucketName, path);
+        }
+
+        /*
+         * - Throws exception on upload failure.
+         * - Returns signed url of the created file on success.
+         */
+        String uploadFileFromBody(
+                S3Connection connection,
+                String bucketName,
+                String path,
+                String body,
+                Boolean usingFilePicker,
+                Date expiryDateTime)
+                throws AppsmithPluginException {
+
+            byte[] payload;
+            MultipartFormDataDTO multipartFormDataDTO;
+            try {
+                multipartFormDataDTO = objectMapper.readValue(body, MultipartFormDataDTO.class);
+            } catch (IOException e) {
+                throw new AppsmithPluginException(
+                        AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                        S3ErrorMessages.UNPARSABLE_CONTENT_ERROR_MSG,
+                        e.getMessage());
+            }
+            if (multipartFormDataDTO == null) {
+                throw new AppsmithPluginException(
+                        AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                        S3ErrorMessages.UNPARSABLE_CONTENT_ERROR_MSG);
+            }
+            if (Boolean.TRUE.equals(usingFilePicker)) {
+
+                String encodedPayload = getEncodedPayloadFromMultipartDTO(multipartFormDataDTO);
+
+                /*
+                 * - For files uploaded using Filepicker.xyz.base64, body format is "<content-type>;base64,<actual-
+                 *   base64-encoded-payload>".
+                 * - Strip off the redundant part in the beginning to get actual payload.
+                 */
+                if (encodedPayload.contains(BASE64_DELIMITER)) {
+                    List<String> bodyArrayList = Arrays.asList(encodedPayload.split(BASE64_DELIMITER));
+                    encodedPayload = bodyArrayList.get(bodyArrayList.size() - 1);
+                }
+
+                try {
+                    payload = Base64.getDecoder().decode(encodedPayload);
+                } catch (IllegalArgumentException e) {
+                    throw new AppsmithPluginException(
+                            AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                            S3ErrorMessages.UNEXPECTED_ENCODING_IN_FILE_CONTENT_ERROR_MSG);
+                }
+            } else {
+                payload =
+                        getEncodedPayloadFromMultipartDTO(multipartFormDataDTO).getBytes();
+            }
+
+            uploadFileInS3(payload, connection, multipartFormDataDTO, bucketName, path);
+            ArrayList<String> listOfFiles = new ArrayList<>();
+            listOfFiles.add(path);
+            ArrayList<String> listOfUrls = getSignedUrls(connection, bucketName, listOfFiles, expiryDateTime);
+            if (listOfUrls.size() != 1) {
+                throw new AppsmithPluginException(
+                        S3PluginError.AMAZON_S3_QUERY_EXECUTION_FAILED, S3ErrorMessages.SIGNED_URL_FETCHING_ERROR_MSG);
+            }
+            String signedUrl = listOfUrls.get(0);
+
+            return signedUrl;
+        }
+
+        /*
+         * - Throws exception on upload failure.
+         * - Returns signed url of the created file on success.
+         */
+        List<String> uploadMultipleFilesFromBody(
+                S3Connection connection,
+                String bucketName,
+                String path,
+                String body,
+                Boolean usingFilePicker,
+                Date expiryDateTime)
+                throws AppsmithPluginException {
+
+            List<MultipartFormDataDTO> multipartFormDataDTOs;
+            try {
+                multipartFormDataDTOs = Arrays.asList(objectMapper.readValue(body, MultipartFormDataDTO[].class));
+            } catch (IOException e) {
+                throw new AppsmithPluginException(
+                        AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                        S3ErrorMessages.UNPARSABLE_CONTENT_ERROR_MSG,
+                        e.getMessage());
+            }
+
+            ArrayList<String> listOfFiles = new ArrayList<>();
+            multipartFormDataDTOs.forEach(multipartFormDataDTO -> {
+                final String filePath = path + multipartFormDataDTO.getName();
+                byte[] payload;
+                if (Boolean.TRUE.equals(usingFilePicker)) {
+
+                    String encodedPayload = getEncodedPayloadFromMultipartDTO(multipartFormDataDTO);
+                    /*
+                     * - For files uploaded using Filepicker.xyz.base64, body format is "<content-type>;base64,<actual-
+                     *   base64-encoded-payload>".
+                     * - Strip off the redundant part in the beginning to get actual payload.
+                     */
+                    if (encodedPayload.contains(BASE64_DELIMITER)) {
+                        List<String> bodyArrayList = Arrays.asList(encodedPayload.split(BASE64_DELIMITER));
+                        encodedPayload = bodyArrayList.get(bodyArrayList.size() - 1);
+                    }
+
+                    try {
+                        payload = Base64.getDecoder().decode(encodedPayload);
+                    } catch (IllegalArgumentException e) {
+                        throw new AppsmithPluginException(
+                                AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                                S3ErrorMessages.UNEXPECTED_ENCODING_IN_FILE_CONTENT_ERROR_MSG,
+                                e.getMessage());
+                    }
+                } else {
+                    payload = getEncodedPayloadFromMultipartDTO(multipartFormDataDTO)
+                            .getBytes();
+                }
+
+                uploadFileInS3(payload, connection, multipartFormDataDTO, bucketName, filePath);
+
+                listOfFiles.add(filePath);
+            });
+
+            return getSignedUrls(connection, bucketName, listOfFiles, expiryDateTime);
+        }
+
+        /*
+         * - Exception thrown here needs to be handled by the caller.
+         */
+        String readFile(S3Connection connection, String bucketName, String path, Boolean encodeContent) {
+            byte[] bytes = connection
+                    .client()
+                    .getObjectAsBytes(GetObjectRequest.builder()
+                            .bucket(bucketName)
+                            .key(path)
+                            .build())
+                    .asByteArrayUnsafe();
+
+            String result;
+            if (Boolean.TRUE.equals(encodeContent)) {
+                result = new String(Base64.getEncoder().encode(bytes));
+            } else {
+                result = new String(bytes);
+            }
+
+            return result;
+        }
+
+        @Override
+        public Mono<ActionExecutionResult> execute(
+                S3Connection connection,
+                DatasourceConfiguration datasourceConfiguration,
+                ActionConfiguration actionConfiguration) {
+            // Unused function
+            return Mono.error(new AppsmithPluginException(
+                    S3PluginError.AMAZON_S3_QUERY_EXECUTION_FAILED, "Unsupported Operation"));
+        }
+
+        @Override
+        public Mono<ActionExecutionResult> executeParameterized(
+                S3Connection connection,
+                ExecuteActionDTO executeActionDTO,
+                DatasourceConfiguration datasourceConfiguration,
+                ActionConfiguration actionConfiguration) {
+
+            log.debug(Thread.currentThread().getName() + ": executeParameterized() called for AmazonS3 plugin.");
+            final Map<String, Object> formData = actionConfiguration.getFormData();
+            List<Map.Entry<String, String>> parameters = new ArrayList<>();
+
+            Boolean smartJsonSubstitution = TRUE;
+
+            Object smartSubstitutionObject =
+                    getDataValueSafelyFromFormData(formData, SMART_SUBSTITUTION, OBJECT_TYPE, TRUE);
+
+            if (smartSubstitutionObject instanceof Boolean) {
+                smartJsonSubstitution = (Boolean) smartSubstitutionObject;
+            } else if (smartSubstitutionObject instanceof String) {
+                // Older UI configuration used to set this value as a string which may/may not be castable to a boolean
+                // directly. This is to ensure we are backward compatible
+                smartJsonSubstitution = Boolean.parseBoolean((String) smartSubstitutionObject);
+            }
+
+            try {
+                // Smartly substitute in Json fields and replace all the bindings with values.
+                if (TRUE.equals(smartJsonSubstitution)) {
+                    final String body = getDataValueSafelyFromFormData(formData, BODY, STRING_TYPE, "");
+                    // First extract all the bindings in order
+                    List<MustacheBindingToken> mustacheKeysInOrder = MustacheHelper.extractMustacheKeysInOrder(body);
+                    // Replace all the bindings with a placeholder
+                    String updatedValue = MustacheHelper.replaceMustacheWithPlaceholder(body, mustacheKeysInOrder);
+
+                    updatedValue = (String) smartSubstitutionOfBindings(
+                            updatedValue, mustacheKeysInOrder, executeActionDTO.getParams(), parameters);
+
+                    setDataValueSafelyInFormData(formData, BODY, updatedValue);
+                }
+            } catch (AppsmithPluginException e) {
+                // Initializing object for error condition
+                ActionExecutionResult errorResult = new ActionExecutionResult();
+                errorResult.setIsExecutionSuccess(false);
+                errorResult.setErrorInfo(e);
+                return Mono.just(errorResult);
+            }
+
+            prepareConfigurationsForExecution(executeActionDTO, actionConfiguration, datasourceConfiguration);
+
+            return this.executeCommon(connection, datasourceConfiguration, actionConfiguration);
+        }
+
+        private Mono<ActionExecutionResult> executeCommon(
+                S3Connection connection,
+                DatasourceConfiguration datasourceConfiguration,
+                ActionConfiguration actionConfiguration) {
+
+            log.debug(Thread.currentThread().getName() + ": executeCommon() called for AmazonS3 plugin.");
+            final String[] query = new String[1];
+            Map<String, Object> requestProperties = new HashMap<>();
+            List<RequestParamDTO> requestParams = new ArrayList<>();
+
+            return Mono.fromCallable(() -> {
+
+                        /*
+                         * - The S3 API does not provide any API to test connection validity or staleness.
+                         *   Hence, unable to do stale connection check explicitly.
+                         * - If connection object is null, then assume stale connection.
+                         */
+                        if (connection == null) {
+                            return Mono.error(new StaleConnectionException(CONNECTION_NULL_ERROR_MSG));
+                        }
+
+                        if (actionConfiguration == null) {
+                            return Mono.error(new AppsmithPluginException(
+                                    AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                                    S3ErrorMessages.MANDATORY_FIELD_MISSING_ERROR_MSG));
+                        }
+
+                        Map<String, Object> formData = actionConfiguration.getFormData();
+                        String command = getDataValueSafelyFromFormData(formData, COMMAND, STRING_TYPE);
+
+                        if (StringUtils.isNullOrEmpty(command)) {
+                            return Mono.error(new AppsmithPluginException(
+                                    AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                                    S3ErrorMessages.MANDATORY_PARAMETER_COMMAND_MISSING_ERROR_MSG));
+                        }
+
+                        AmazonS3Action s3Action = AmazonS3Action.valueOf(command);
+                        query[0] = s3Action.name();
+
+                        requestParams.add(new RequestParamDTO(COMMAND, command, null, null, null));
+
+                        final String bucketName = (s3Action == AmazonS3Action.LIST_BUCKETS)
+                                ? null
+                                : getDataValueSafelyFromFormData(formData, BUCKET, STRING_TYPE);
+
+                        // If the action_type is LIST_BUCKET, remove the bucket name requirement
+                        if (s3Action != AmazonS3Action.LIST_BUCKETS && StringUtils.isNullOrEmpty(bucketName)) {
+                            return Mono.error(new AppsmithPluginException(
+                                    AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                                    S3ErrorMessages.MANDATORY_PARAMETER_BUCKET_MISSING_ERROR_MSG));
+                        }
+
+                        requestProperties.put(BUCKET, bucketName == null ? "" : bucketName);
+                        requestParams.add(new RequestParamDTO(BUCKET, bucketName, null, null, null));
+
+                        /*
+                         * - Allow users to upload empty file. Hence, only check for null value.
+                         */
+                        final String body = getDataValueSafelyFromFormData(formData, BODY, STRING_TYPE);
+                        requestProperties.put("content", body == null ? "null" : body);
+
+                        if (s3Action == AmazonS3Action.UPLOAD_FILE_FROM_BODY && body == null) {
+                            return Mono.error(new AppsmithPluginException(
+                                    AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                                    S3ErrorMessages.MANDATORY_PARAMETER_CONTENT_MISSING_ERROR_MSG));
+                        }
+
+                        final String path = getDataValueSafelyFromFormData(formData, PATH, STRING_TYPE, "");
+                        requestProperties.put(PATH, path);
+
+                        if ((s3Action == AmazonS3Action.UPLOAD_FILE_FROM_BODY
+                                        || s3Action == AmazonS3Action.READ_FILE
+                                        || s3Action == AmazonS3Action.DELETE_FILE)
+                                && StringUtils.isNullOrEmpty(path)) {
+                            return Mono.error(new AppsmithPluginException(
+                                    AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                                    S3ErrorMessages.MANDATORY_PARAMETER_FILE_PATH_MISSING_ERROR_MSG));
+                        }
+                        Object actionResult;
+                        switch (s3Action) {
+                            case LIST:
+                                log.debug(
+                                        Thread.currentThread().getName() + ": LIST action called for AmazonS3 plugin.");
+                                String prefix = getDataValueSafelyFromFormData(formData, LIST_PREFIX, STRING_TYPE, "");
+                                requestParams.add(new RequestParamDTO(LIST_PREFIX, prefix, null, null, null));
+
+                                ArrayList<String> listOfFiles = listAllFilesInBucket(connection, bucketName, prefix);
+
+                                Boolean isSignedUrl = YES.equals(
+                                        getDataValueSafelyFromFormData(formData, LIST_SIGNED_URL, STRING_TYPE));
+
+                                if (isSignedUrl) {
+                                    requestParams.add(new RequestParamDTO(LIST_SIGNED_URL, YES, null, null, null));
+
+                                    int durationInMinutes;
+
+                                    try {
+                                        durationInMinutes = Integer.parseInt(getDataValueSafelyFromFormData(
+                                                formData, LIST_EXPIRY, STRING_TYPE, DEFAULT_URL_EXPIRY_IN_MINUTES));
+                                    } catch (NumberFormatException e) {
+                                        return Mono.error(new AppsmithPluginException(
+                                                AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                                                S3ErrorMessages.EXPIRY_DURATION_NOT_A_NUMBER_ERROR_MSG,
+                                                e.getMessage()));
+                                    }
+
+                                    requestParams.add(
+                                            new RequestParamDTO(LIST_EXPIRY, durationInMinutes, null, null, null));
+
+                                    Calendar calendar = Calendar.getInstance();
+                                    calendar.add(Calendar.MINUTE, durationInMinutes);
+                                    Date expiryDateTime = calendar.getTime();
+                                    DateFormat dateTimeFormat = new SimpleDateFormat("dd MMM yyyy HH:mm:ss:SSS z");
+                                    String expiryDateTimeString = dateTimeFormat.format(expiryDateTime);
+
+                                    ArrayList<String> listOfSignedUrls =
+                                            getSignedUrls(connection, bucketName, listOfFiles, expiryDateTime);
+                                    if (listOfFiles.size() != listOfSignedUrls.size()) {
+                                        return Mono.error(new AppsmithPluginException(
+                                                S3PluginError.AMAZON_S3_QUERY_EXECUTION_FAILED,
+                                                S3ErrorMessages.ACTION_LIST_OF_FILE_FETCHING_ERROR_MSG));
+                                    }
+
+                                    actionResult = new ArrayList<>();
+                                    for (int i = 0; i < listOfFiles.size(); i++) {
+                                        HashMap<String, Object> fileInfo = new HashMap<>();
+                                        fileInfo.put("fileName", listOfFiles.get(i));
+                                        fileInfo.put("signedUrl", listOfSignedUrls.get(i));
+                                        fileInfo.put("urlExpiryDate", expiryDateTimeString);
+                                        ((ArrayList<Object>) actionResult).add(fileInfo);
+                                    }
+                                } else {
+                                    requestParams.add(new RequestParamDTO(LIST_SIGNED_URL, "", null, null, null));
+                                    actionResult = new ArrayList<>();
+                                    for (int i = 0; i < listOfFiles.size(); i++) {
+                                        HashMap<String, Object> fileInfo = new HashMap<>();
+                                        fileInfo.put("fileName", listOfFiles.get(i));
+                                        ((ArrayList<Object>) actionResult).add(fileInfo);
+                                    }
+                                }
+
+                                String isUnsignedUrl =
+                                        getDataValueSafelyFromFormData(formData, LIST_UNSIGNED_URL, STRING_TYPE);
+
+                                if (YES.equals(isUnsignedUrl)) {
+
+                                    requestParams.add(new RequestParamDTO(LIST_UNSIGNED_URL, YES, null, null, null));
+                                    ((ArrayList<Object>) actionResult).stream().forEach(item -> ((Map) item)
+                                            .put(
+                                                    "url", // key
+                                                    connection.unsignedUrl(
+                                                            bucketName, (String) ((Map) item).get("fileName")) // value
+                                                    ));
+                                } else {
+                                    requestParams.add(new RequestParamDTO(LIST_UNSIGNED_URL, NO, null, null, null));
+                                }
+
+                                // Check if where condition is configured
+                                Object whereFormObject =
+                                        getDataValueSafelyFromFormData(formData, LIST_WHERE, OBJECT_TYPE);
+                                Condition condition = null;
+
+                                if (whereFormObject != null) {
+                                    Map<String, Object> whereForm = (Map<String, Object>) whereFormObject;
+                                    condition = parseWhereClause(whereForm);
+                                }
+
+                                List<Map<String, String>> sortBy = getDataValueSafelyFromFormData(
+                                        formData, LIST_SORT, new TypeReference<List<Map<String, String>>>() {});
+
+                                Map<String, String> paginateBy = getDataValueSafelyFromFormData(
+                                        formData, LIST_PAGINATE, new TypeReference<Map<String, String>>() {});
+
+                                ArrayNode preFilteringResponse = objectMapper.valueToTree(actionResult);
+                                actionResult = filterDataService.filterDataNew(
+                                        preFilteringResponse,
+                                        new UQIDataFilterParams(condition, null, sortBy, paginateBy));
+
+                                break;
+                            case UPLOAD_FILE_FROM_BODY: {
+                                log.debug(Thread.currentThread().getName()
+                                        + ": UPLOAD_FILE_FROM_BODY action called for AmazonS3 plugin.");
+                                requestParams.add(
+                                        new RequestParamDTO(ACTION_CONFIGURATION_PATH, path, null, null, null));
+
+                                int durationInMinutes;
+
+                                try {
+                                    durationInMinutes = Integer.parseInt(getDataValueSafelyFromFormData(
+                                            formData, CREATE_EXPIRY, STRING_TYPE, DEFAULT_URL_EXPIRY_IN_MINUTES));
+                                } catch (NumberFormatException e) {
+                                    return Mono.error(new AppsmithPluginException(
+                                            AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                                            S3ErrorMessages.EXPIRY_DURATION_NOT_A_NUMBER_ERROR_MSG,
+                                            e.getMessage()));
+                                }
+
+                                requestProperties.put("expiry duration in minutes", String.valueOf(durationInMinutes));
+
+                                Calendar calendar = Calendar.getInstance();
+                                calendar.add(Calendar.MINUTE, durationInMinutes);
+                                Date expiryDateTime = calendar.getTime();
+                                DateFormat dateTimeFormat = new SimpleDateFormat("dd MMM yyyy HH:mm:ss:SSS z");
+                                String expiryDateTimeString = dateTimeFormat.format(expiryDateTime);
+
+                                String signedUrl;
+
+                                String dataType =
+                                        getDataValueSafelyFromFormData(formData, CREATE_DATATYPE, STRING_TYPE);
+
+                                if (YES.equals(dataType)) {
+                                    requestParams.add(new RequestParamDTO(CREATE_DATATYPE, "Base64", null, null, null));
+                                    signedUrl = uploadFileFromBody(
+                                            connection, bucketName, path, body, true, expiryDateTime);
+                                } else {
+                                    requestParams.add(
+                                            new RequestParamDTO(CREATE_DATATYPE, "Text / Binary", null, null, null));
+                                    signedUrl = uploadFileFromBody(
+                                            connection, bucketName, path, body, false, expiryDateTime);
+                                }
+                                // gets the unsigned url for the file
+                                String url = createFileUrl(connection, bucketName, path);
+                                actionResult = new HashMap<String, Object>();
+                                ((HashMap<String, Object>) actionResult).put("signedUrl", signedUrl);
+                                ((HashMap<String, Object>) actionResult).put("urlExpiryDate", expiryDateTimeString);
+                                ((HashMap<String, Object>) actionResult).put("url", url);
+                                requestParams.add(
+                                        new RequestParamDTO(CREATE_EXPIRY, expiryDateTimeString, null, null, null));
+                                requestParams.add(
+                                        new RequestParamDTO(ACTION_CONFIGURATION_BODY, body, null, null, null));
+                                break;
+                            }
+                            case UPLOAD_MULTIPLE_FILES_FROM_BODY: {
+                                log.debug(Thread.currentThread().getName()
+                                        + ": UPLOAD_MULTIPLE_FILES_FROM_BODY action called for AmazonS3 plugin.");
+                                requestParams.add(
+                                        new RequestParamDTO(ACTION_CONFIGURATION_PATH, path, null, null, null));
+
+                                int durationInMinutes;
+
+                                try {
+                                    durationInMinutes = Integer.parseInt(getDataValueSafelyFromFormData(
+                                            formData, CREATE_EXPIRY, STRING_TYPE, DEFAULT_URL_EXPIRY_IN_MINUTES));
+                                } catch (NumberFormatException e) {
+                                    return Mono.error(new AppsmithPluginException(
+                                            AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                                            S3ErrorMessages.EXPIRY_DURATION_NOT_A_NUMBER_ERROR_MSG,
+                                            e.getMessage()));
+                                }
+
+                                requestProperties.put("expiry duration in minutes", String.valueOf(durationInMinutes));
+
+                                Calendar calendar = Calendar.getInstance();
+                                calendar.add(Calendar.MINUTE, durationInMinutes);
+                                Date expiryDateTime = calendar.getTime();
+                                DateFormat dateTimeFormat = new SimpleDateFormat("dd MMM yyyy HH:mm:ss:SSS z");
+                                String expiryDateTimeString = dateTimeFormat.format(expiryDateTime);
+
+                                List<String> signedUrls;
+
+                                String dataType =
+                                        getDataValueSafelyFromFormData(formData, CREATE_DATATYPE, STRING_TYPE);
+
+                                if (YES.equals(dataType)) {
+                                    requestParams.add(new RequestParamDTO(CREATE_DATATYPE, "Base64", null, null, null));
+                                    signedUrls = uploadMultipleFilesFromBody(
+                                            connection, bucketName, path, body, true, expiryDateTime);
+                                } else {
+                                    requestParams.add(
+                                            new RequestParamDTO(CREATE_DATATYPE, "Text / Binary", null, null, null));
+                                    signedUrls = uploadMultipleFilesFromBody(
+                                            connection, bucketName, path, body, false, expiryDateTime);
+                                }
+                                actionResult = new HashMap<String, Object>();
+                                ((HashMap<String, Object>) actionResult).put("signedUrls", signedUrls);
+                                ((HashMap<String, Object>) actionResult).put("urlExpiryDate", expiryDateTimeString);
+                                // Adds the unsigned urls in the response
+                                ((HashMap<String, Object>) actionResult)
+                                        .put("urls", createFileUrlsFromBody(connection, bucketName, path, body));
+
+                                requestParams.add(
+                                        new RequestParamDTO(CREATE_EXPIRY, expiryDateTimeString, null, null, null));
+                                requestParams.add(
+                                        new RequestParamDTO(ACTION_CONFIGURATION_BODY, body, null, null, null));
+                                break;
+                            }
+                            case READ_FILE:
+                                log.debug(Thread.currentThread().getName()
+                                        + ": READ_FILE action called for AmazonS3 plugin.");
+                                requestParams.add(
+                                        new RequestParamDTO(ACTION_CONFIGURATION_PATH, path, null, null, null));
+
+                                String result;
+
+                                String isBase64 = getDataValueSafelyFromFormData(formData, READ_DATATYPE, STRING_TYPE);
+
+                                if (YES.equals(isBase64)) {
+                                    requestParams.add(new RequestParamDTO(READ_DATATYPE, YES, null, null, null));
+                                    result = readFile(connection, bucketName, path, true);
+                                } else {
+                                    requestParams.add(new RequestParamDTO(READ_DATATYPE, NO, null, null, null));
+                                    result = readFile(connection, bucketName, path, false);
+                                }
+                                actionResult = Map.of("fileData", result);
+                                break;
+                            case DELETE_FILE:
+                                log.debug(Thread.currentThread().getName()
+                                        + ": DELETE_FILE action called for AmazonS3 plugin.");
+                                requestParams.add(
+                                        new RequestParamDTO(ACTION_CONFIGURATION_PATH, path, null, null, null));
+
+                                /*
+                                 * - If attempting to delete an object that does not exist, Amazon S3 returns a success message
+                                 *   instead of an error message.
+                                 */
+                                connection.client().deleteObject(deleteObjectRequest(bucketName, path));
+                                actionResult = Map.of("status", "File deleted successfully");
+                                break;
+                            case DELETE_MULTIPLE_FILES:
+                                log.debug(Thread.currentThread().getName()
+                                        + ": DELETE_MULTIPLE_FILES action called for AmazonS3 plugin.");
+                                requestParams.add(
+                                        new RequestParamDTO(ACTION_CONFIGURATION_PATH, path, null, null, null));
+
+                                List<Property> properties = datasourceConfiguration.getProperties();
+                                String s3Provider = (String) properties
+                                        .get(S3_SERVICE_PROVIDER_PROPERTY_INDEX)
+                                        .getValue();
+
+                                deleteMultipleObjects(s3Provider, connection, bucketName, path);
+                                actionResult = Map.of("status", "All files deleted successfully");
+                                break;
+                            default:
+                                return Mono.error(new AppsmithPluginException(
+                                        S3PluginError.AMAZON_S3_QUERY_EXECUTION_FAILED,
+                                        String.format(S3ErrorMessages.UNSUPPORTED_ACTION_ERROR_MSG, query[0])));
+                        }
+                        return Mono.just(actionResult);
+                    })
+                    .onErrorMap(IllegalStateException.class, error -> new StaleConnectionException(error.getMessage()))
+                    .flatMap(obj -> obj)
+                    .flatMap(result -> {
+                        ActionExecutionResult actionExecutionResult = new ActionExecutionResult();
+                        actionExecutionResult.setBody(result);
+                        actionExecutionResult.setIsExecutionSuccess(true);
+                        log.debug("In the S3 Plugin, got action execution result");
+                        return Mono.just(actionExecutionResult);
+                    })
+                    .onErrorResume(e -> {
+                        ActionExecutionResult result = new ActionExecutionResult();
+                        result.setIsExecutionSuccess(false);
+                        if (e instanceof StaleConnectionException) {
+                            return Mono.error(e);
+                        } else if (!(e instanceof AppsmithPluginException)) {
+                            e = new AppsmithPluginException(
+                                    e,
+                                    S3PluginError.AMAZON_S3_QUERY_EXECUTION_FAILED,
+                                    S3ErrorMessages.QUERY_EXECUTION_FAILED_ERROR_MSG);
+                        }
+                        result.setErrorInfo(e, amazonS3ErrorUtils);
+                        return Mono.just(result);
+                    })
+                    // Now set the request in the result to be returned to the server
+                    .map(actionExecutionResult -> {
+                        log.debug(Thread.currentThread().getName()
+                                + ": Setting the actionExecutionResult for AmazonS3 plugin.");
+                        ActionExecutionRequest actionExecutionRequest = new ActionExecutionRequest();
+                        actionExecutionRequest.setQuery(query[0]);
+                        actionExecutionRequest.setProperties(requestProperties);
+                        actionExecutionRequest.setRequestParams(requestParams);
+                        actionExecutionResult.setRequest(actionExecutionRequest);
+                        return actionExecutionResult;
+                    })
+                    .subscribeOn(scheduler);
+        }
+
+        private void deleteMultipleObjects(String s3Provider, S3Connection connection, String bucketName, String path)
+                throws AppsmithPluginException {
+            List<String> listOfFiles;
+            try {
+                listOfFiles = parseList(path);
+            } catch (IOException e) {
+                throw new AppsmithPluginException(
+                        AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                        S3ErrorMessages.LIST_OF_FILE_PARSING_ERROR_MSG,
+                        e.getMessage());
+            }
+
+            DeleteObjectsRequest deleteObjectsRequest = getDeleteObjectsRequest(bucketName, listOfFiles);
+            try {
+                if (GOOGLE_CLOUD_SERVICE_PROVIDER.equals(s3Provider)) {
+                    for (String filePath : listOfFiles) {
+                        connection.client().deleteObject(deleteObjectRequest(bucketName, filePath));
+                    }
+                } else {
+                    DeleteObjectsResponse response = connection.client().deleteObjects(deleteObjectsRequest);
+                    if (response.hasErrors() && !response.errors().isEmpty()) {
+                        throw new AppsmithPluginException(
+                                S3PluginError.AMAZON_S3_QUERY_EXECUTION_FAILED,
+                                S3ErrorMessages.FILE_CANNOT_BE_DELETED_ERROR_MSG,
+                                bulkDeleteErrorDetail(response.errors()));
+                    }
+                }
+            } catch (SdkException e) {
+                throw new AppsmithPluginException(
+                        S3PluginError.AMAZON_S3_QUERY_EXECUTION_FAILED,
+                        S3ErrorMessages.FILE_CANNOT_BE_DELETED_ERROR_MSG,
+                        e.getMessage());
+            }
+        }
+
+        /**
+         * Names the first {@link #MAX_BULK_DELETE_ERRORS_NAMED} objects a bulk delete could not delete, each with the
+         * code and message S3 gave for it, and counts the others. A message longer than {@link
+         * #MAX_BULK_DELETE_ERROR_MESSAGE_LENGTH} characters is cut to that length and ends with "...".
+         */
+        private static String bulkDeleteErrorDetail(List<S3Error> errors) {
+            String named = errors.stream()
+                    .limit(MAX_BULK_DELETE_ERRORS_NAMED)
+                    .map(error -> error.key() + " (" + error.code() + ": " + truncated(error.message()) + ")")
+                    .collect(Collectors.joining(", ", BULK_DELETE_ERRORS_MESSAGE + ": ", ""));
+            int notNamed = errors.size() - MAX_BULK_DELETE_ERRORS_NAMED;
+            return notNamed > 0 ? named + ", and " + notNamed + " more" : named;
+        }
+
+        private static String truncated(String message) {
+            return message == null || message.length() <= MAX_BULK_DELETE_ERROR_MESSAGE_LENGTH
+                    ? message
+                    : message.substring(0, MAX_BULK_DELETE_ERROR_MESSAGE_LENGTH) + "...";
+        }
+
+        private static DeleteObjectRequest deleteObjectRequest(String bucketName, String key) {
+            return DeleteObjectRequest.builder().bucket(bucketName).key(key).build();
+        }
+
+        private DeleteObjectsRequest getDeleteObjectsRequest(String bucketName, List<String> listOfFiles) {
+            List<ObjectIdentifier> objects = listOfFiles.stream()
+                    .map(key -> ObjectIdentifier.builder().key(key).build())
+                    .collect(Collectors.toList());
+            return DeleteObjectsRequest.builder()
+                    .bucket(bucketName)
+                    .delete(Delete.builder().objects(objects).build())
+                    .build();
+        }
+
+        @Override
+        public Mono<S3Connection> datasourceCreate(DatasourceConfiguration datasourceConfiguration) {
+            log.debug(Thread.currentThread().getName() + ": datasourceCreate() called for AmazonS3 plugin.");
+            try {
+                Class.forName(S3_DRIVER);
+            } catch (ClassNotFoundException e) {
+                return Mono.error(new AppsmithPluginException(
+                        S3PluginError.AMAZON_S3_QUERY_EXECUTION_FAILED,
+                        S3ErrorMessages.S3_DRIVER_LOADING_ERROR_MSG,
+                        e.getMessage()));
+            }
+
+            return Mono.fromCallable(() -> createConnection(datasourceConfiguration))
+                    .flatMap(client -> Mono.just(client))
+                    .onErrorResume(e -> {
+                        if (e instanceof AppsmithPluginException) {
+                            return Mono.error(e);
+                        }
+
+                        return Mono.error(new AppsmithPluginException(
+                                S3PluginError.AMAZON_S3_QUERY_EXECUTION_FAILED,
+                                S3ErrorMessages.CONNECTIVITY_ERROR_MSG,
+                                e.getMessage()));
+                    })
+                    .subscribeOn(scheduler);
+        }
+
+        @Override
+        public void datasourceDestroy(S3Connection connection) {
+            log.debug(Thread.currentThread().getName() + ": datasourceDestroy() called for AmazonS3 plugin.");
+            if (connection != null) {
+                // Closing the client releases its HTTP connection pool; keep it off the caller thread.
+                Mono.fromRunnable(connection::close)
+                        .subscribeOn(scheduler)
+                        .subscribe(ignored -> {}, error -> log.error("Error closing S3 connection.", error));
+            }
+        }
+
+        @Override
+        public Set<String> validateDatasource(DatasourceConfiguration datasourceConfiguration) {
+            log.debug(Thread.currentThread().getName() + ": validateDatasource() called for AmazonS3 plugin.");
+            Set<String> invalids = new HashSet<>();
+
+            if (datasourceConfiguration == null || datasourceConfiguration.getAuthentication() == null) {
+                invalids.add(S3ErrorMessages.DS_AT_LEAST_ONE_MANDATORY_PARAMETER_MISSING_ERROR_MSG);
+            } else {
+                DBAuth authentication = (DBAuth) datasourceConfiguration.getAuthentication();
+                if (StringUtils.isNullOrEmpty(authentication.getUsername())) {
+                    invalids.add(S3ErrorMessages.DS_MANDATORY_PARAMETER_ACCESS_KEY_MISSING_ERROR_MSG);
+                }
+
+                if (StringUtils.isNullOrEmpty(authentication.getPassword())) {
+                    invalids.add(S3ErrorMessages.DS_MANDATORY_PARAMETER_SECRET_KEY_MISSING_ERROR_MSG);
+                }
+            }
+
+            List<Property> properties = datasourceConfiguration.getProperties();
+
+            /*
+             * - Ideally, properties must never be null because the fields contained in the properties list have a
+             *   default value defined.
+             * - Ideally, properties.get(S3_SERVICE_PROVIDER_PROPERTY_INDEX) must never be null/empty, because the
+             *   `S3 service provider` dropdown has a default value.
+             */
+            if (properties == null
+                    || properties.get(S3_SERVICE_PROVIDER_PROPERTY_INDEX) == null
+                    || StringUtils.isNullOrEmpty((String)
+                            properties.get(S3_SERVICE_PROVIDER_PROPERTY_INDEX).getValue())) {
+                invalids.add(S3ErrorMessages.DS_S3_SERVICE_PROVIDER_PROPERTIES_FETCHING_ERROR_MSG);
+            }
+            boolean usingAWSS3ServiceProvider = false;
+            if (properties != null && properties.get(S3_SERVICE_PROVIDER_PROPERTY_INDEX) != null) {
+                usingAWSS3ServiceProvider = AWS_S3_SERVICE_PROVIDER.equals(
+                        properties.get(S3_SERVICE_PROVIDER_PROPERTY_INDEX).getValue());
+            }
+            if (!usingAWSS3ServiceProvider
+                    && (CollectionUtils.isEmpty(datasourceConfiguration.getEndpoints())
+                            || datasourceConfiguration.getEndpoints().get(CUSTOM_ENDPOINT_INDEX) == null
+                            || StringUtils.isNullOrEmpty(datasourceConfiguration
+                                    .getEndpoints()
+                                    .get(CUSTOM_ENDPOINT_INDEX)
+                                    .getHost()))) {
+                invalids.add(S3ErrorMessages.DS_MANDATORY_PARAMETER_ENDPOINT_URL_MISSING_ERROR_MSG);
+            }
+
+            if (datasourceConfiguration != null) {
+                String serviceProvider = (String)
+                        properties.get(S3_SERVICE_PROVIDER_PROPERTY_INDEX).getValue();
+                if (GOOGLE_CLOUD_SERVICE_PROVIDER.equals(serviceProvider)) {
+                    String defaultBucket = (String)
+                            properties.get(DEFAULT_BUCKET_PROPERTY_INDEX).getValue();
+                    if (StringUtils.isNullOrEmpty(defaultBucket)) {
+                        invalids.add(S3ErrorMessages.DS_MANDATORY_PARAMETER_DEFAULT_BUCKET_MISSING_ERROR_MSG);
+                    }
+                }
+            }
+
+            return invalids;
+        }
+
+        @Override
+        public Mono<DatasourceTestResult> testDatasource(DatasourceConfiguration datasourceConfiguration) {
+            log.debug(Thread.currentThread().getName() + ": testDatasource() called for AmazonS3 plugin.");
+            if (datasourceConfiguration == null) {
+                return Mono.just(new DatasourceTestResult(
+                        S3ErrorMessages.DS_AT_LEAST_ONE_MANDATORY_PARAMETER_MISSING_ERROR_MSG));
+            }
+
+            List<Property> properties = datasourceConfiguration.getProperties();
+            String s3Provider =
+                    (String) properties.get(S3_SERVICE_PROVIDER_PROPERTY_INDEX).getValue();
+
+            // Handle Google Cloud Storage in a separate method if necessary
+            if (GOOGLE_CLOUD_SERVICE_PROVIDER.equals(s3Provider)) {
+                return testGoogleCloudStorage(datasourceConfiguration);
+            }
+
+            // For Amazon S3 or other providers, perform a standard test by listing buckets in Amazon S3
+            return datasourceCreate(datasourceConfiguration)
+                    .flatMap(connection -> Mono.fromCallable(() -> {
+                                /*
+                                 * - Creating a connection object with wrong credentials does not throw any exception.
+                                 * - Hence, adding a listBuckets() method call to test the connection.
+                                 */
+                                log.debug(Thread.currentThread().getName()
+                                        + ": listBuckets() called for AmazonS3 plugin.");
+                                connection.client().listBuckets();
+                                return new DatasourceTestResult();
+                            })
+                            .onErrorResume(error -> {
+                                if (error instanceof AwsServiceException serviceException
+                                        && ACCESS_DENIED_ERROR_CODE.equals(errorCode(serviceException))) {
+                                    /**
+                                     * Sometimes a valid account credential may not have permission to run listBuckets action
+                                     * . In this case `AccessDenied` error is returned.
+                                     * That fact that the credentials caused `AccessDenied` error instead of invalid access key
+                                     * id or signature mismatch error means that the credentials are valid, we are able to
+                                     * establish a connection as well, but the account does not have permission to run
+                                     * listBuckets.
+                                     */
+                                    return Mono.just(new DatasourceTestResult());
+                                }
+
+                                return Mono.just(new DatasourceTestResult(amazonS3ErrorUtils.getReadableError(error)));
+                            })
+                            .doFinally(signalType -> connection.close()))
+                    .onErrorResume(error -> Mono.just(new DatasourceTestResult(error.getMessage())))
+                    .subscribeOn(scheduler);
+        }
+
+        private static String errorCode(AwsServiceException serviceException) {
+            AwsErrorDetails details = serviceException.awsErrorDetails();
+            return details == null ? null : details.errorCode();
+        }
+
+        private Mono<DatasourceTestResult> testGoogleCloudStorage(DatasourceConfiguration datasourceConfiguration) {
+            List<Property> properties = datasourceConfiguration.getProperties();
+            String defaultBucket =
+                    (String) properties.get(DEFAULT_BUCKET_PROPERTY_INDEX).getValue();
+            if (StringUtils.isNullOrEmpty(defaultBucket)) {
+                return Mono.just(new DatasourceTestResult(
+                        S3ErrorMessages.DS_MANDATORY_PARAMETER_DEFAULT_BUCKET_MISSING_ERROR_MSG));
+            }
+
+            return datasourceCreate(datasourceConfiguration)
+                    .flatMap(connection -> Mono.fromCallable(() -> {
+                                connection.client().listObjects(list -> list.bucket(defaultBucket)
+                                        .encodingType(EncodingType.URL));
+                                log.debug(Thread.currentThread().getName()
+                                        + ": connection.listObjects() called for AmazonS3 plugin.");
+                                return new DatasourceTestResult();
+                            })
+                            .onErrorResume(error -> {
+                                if (error instanceof AwsServiceException serviceException
+                                        && serviceException.statusCode() == 404) {
+                                    return Mono.just(
+                                            new DatasourceTestResult(S3ErrorMessages.NON_EXITED_BUCKET_ERROR_MSG));
+                                } else {
+                                    return Mono.just(
+                                            new DatasourceTestResult(amazonS3ErrorUtils.getReadableError(error)));
+                                }
+                            })
+                            .doFinally(signalType -> connection.close()))
+                    .onErrorResume(error -> Mono.just(new DatasourceTestResult(error.getMessage())))
+                    .subscribeOn(scheduler);
+        }
+
+        /**
+         * Since S3 storage is not like a regular database, this method returns a list of buckets as the datasource
+         * structure.
+         */
+        @Override
+        public Mono<DatasourceStructure> getStructure(
+                S3Connection connection, DatasourceConfiguration datasourceConfiguration) {
+
+            log.debug(Thread.currentThread().getName() + ": getStructure() called for AmazonS3 plugin.");
+            return Mono.fromSupplier(() -> {
+                        List<DatasourceStructure.Table> tableList;
+                        try {
+                            log.debug(Thread.currentThread().getName()
+                                    + ": connection.listBuckets() called for AmazonS3 plugin.");
+                            tableList = connection.client().listBuckets().buckets().stream()
+                                    /* Get name of each bucket */
+                                    .map(Bucket::name)
+                                    /* Get command templates and use it to create Table object */
+                                    .map(bucketName -> new DatasourceStructure.Table(
+                                            DatasourceStructure.TableType.BUCKET,
+                                            "",
+                                            bucketName,
+                                            new ArrayList<>(),
+                                            new ArrayList<>(),
+                                            getTemplates(bucketName, DEFAULT_FILE_NAME)))
+                                    /* Collect all Table objects in a list */
+                                    .collect(Collectors.toList());
+                        } catch (SdkException e) {
+                            throw new AppsmithPluginException(
+                                    AppsmithPluginError.PLUGIN_GET_STRUCTURE_ERROR,
+                                    S3ErrorMessages.LIST_OF_BUCKET_FETCHING_ERROR_MSG,
+                                    e.getMessage());
+                        } catch (IllegalStateException e) {
+                            throw new StaleConnectionException(e.getMessage());
+                        }
+
+                        return new DatasourceStructure(tableList);
+                    })
+                    .subscribeOn(scheduler);
+        }
+
+        @Override
+        public Object substituteValueInInput(
+                int index,
+                String binding,
+                String value,
+                Object input,
+                List<Map.Entry<String, String>> insertedParams,
+                Object... args) {
+            String jsonBody = (String) input;
+            Param param = (Param) args[0];
+            log.debug(Thread.currentThread().getName() + ": substituteValueInInput() called for AmazonS3 plugin.");
+            return DataTypeStringUtils.jsonSmartReplacementPlaceholderWithValue(
+                    jsonBody, value, null, insertedParams, null, param);
+        }
+
+        private String getEncodedPayloadFromMultipartDTO(MultipartFormDataDTO multipartFormDataDTO) {
+            String encodedPayload;
+            if (multipartFormDataDTO.getData() instanceof LinkedHashMap) {
+                encodedPayload = ((LinkedHashMap<?, ?>) multipartFormDataDTO.getData())
+                        .get("data")
+                        .toString();
+            } else {
+                encodedPayload = (String) multipartFormDataDTO.getData();
+            }
+            return encodedPayload;
+        }
+
+        /**
+         * Uploads the payload as a single PutObject request, or as a multipart upload when it is larger than {@link
+         * #MULTIPART_UPLOAD_THRESHOLD}. The request bodies read the payload array in place; the array is not modified
+         * afterwards.
+         */
+        void uploadFileInS3(
+                byte[] payload,
+                S3Connection connection,
+                MultipartFormDataDTO multipartFormDataDTO,
+                String bucketName,
+                String path) {
+            if (payload.length > MULTIPART_UPLOAD_THRESHOLD) {
+                multipartUpload(payload, connection, multipartFormDataDTO, bucketName, path);
+                return;
+            }
+
+            PutObjectRequest.Builder putObjectRequest = PutObjectRequest.builder()
+                    .bucket(bucketName)
+                    .key(path)
+                    // Set content length
+                    .contentLength((long) payload.length);
+
+            // Only add content type if the user has mentioned it in the body
+            if (multipartFormDataDTO.getType() != null) {
+                putObjectRequest.contentType(multipartFormDataDTO.getType());
+            }
+
+            // Calculate and set Content-MD5 header for Object Lock compliance
+            String md5Base64 = contentMd5(payload, 0, payload.length);
+            if (md5Base64 != null) {
+                putObjectRequest.contentMD5(md5Base64);
+                log.debug("Set Content-MD5 header for S3 upload: {}", md5Base64);
+            }
+
+            RequestBody requestBody = RequestBody.fromContentProvider(
+                    ContentStreamProvider.fromByteArrayUnsafe(payload), payload.length, DEFAULT_UPLOAD_CONTENT_TYPE);
+            connection.client().putObject(putObjectRequest.build(), requestBody);
+        }
+
+        /**
+         * Uploads the payload in parts of {@link #MINIMUM_UPLOAD_PART_SIZE} or more, one after another, each with its
+         * own Content-MD5. A part that fails is retried on its own by the client's retry strategy. When the upload
+         * fails after it was created, for any reason, it is aborted so that the service discards the parts already
+         * stored, and the original failure is thrown.
+         */
+        private void multipartUpload(
+                byte[] payload,
+                S3Connection connection,
+                MultipartFormDataDTO multipartFormDataDTO,
+                String bucketName,
+                String path) {
+            S3Client client = connection.client();
+            String contentType = multipartFormDataDTO.getType() != null
+                    ? multipartFormDataDTO.getType()
+                    : DEFAULT_UPLOAD_CONTENT_TYPE;
+            String uploadId = client.createMultipartUpload(CreateMultipartUploadRequest.builder()
+                            .bucket(bucketName)
+                            .key(path)
+                            .contentType(contentType)
+                            .build())
+                    .uploadId();
+
+            try {
+                long partSize = Math.max(
+                        MINIMUM_UPLOAD_PART_SIZE, (payload.length + MAXIMUM_UPLOAD_PARTS - 1) / MAXIMUM_UPLOAD_PARTS);
+                List<CompletedPart> completedParts = new ArrayList<>();
+                for (int partNumber = 1, offset = 0; offset < payload.length; partNumber++) {
+                    int partOffset = offset;
+                    int partLength = (int) Math.min(partSize, payload.length - partOffset);
+                    UploadPartRequest.Builder uploadPartRequest = UploadPartRequest.builder()
+                            .bucket(bucketName)
+                            .key(path)
+                            .uploadId(uploadId)
+                            .partNumber(partNumber)
+                            .contentLength((long) partLength);
+                    String md5Base64 = contentMd5(payload, partOffset, partLength);
+                    if (md5Base64 != null) {
+                        uploadPartRequest.contentMD5(md5Base64);
+                    }
+                    RequestBody requestBody = RequestBody.fromContentProvider(
+                            () -> new ByteArrayInputStream(payload, partOffset, partLength),
+                            partLength,
+                            DEFAULT_UPLOAD_CONTENT_TYPE);
+                    String eTag = client.uploadPart(uploadPartRequest.build(), requestBody)
+                            .eTag();
+                    completedParts.add(CompletedPart.builder()
+                            .partNumber(partNumber)
+                            .eTag(eTag)
+                            .build());
+                    offset += partLength;
+                }
+
+                client.completeMultipartUpload(CompleteMultipartUploadRequest.builder()
+                        .bucket(bucketName)
+                        .key(path)
+                        .uploadId(uploadId)
+                        .multipartUpload(CompletedMultipartUpload.builder()
+                                .parts(completedParts)
+                                .build())
+                        .build());
+            } catch (Throwable e) {
+                abortMultipartUpload(client, bucketName, path, uploadId, e);
+                throw e;
+            }
+        }
+
+        /**
+         * Aborts a multipart upload that failed with the given error, so that the service discards its parts. The
+         * client refuses to send requests on an interrupted thread, as when the action times out: the interrupt is
+         * cleared for the abort and restored afterwards. An abort failure is attached to the error as suppressed.
+         */
+        private static void abortMultipartUpload(
+                S3Client client, String bucketName, String path, String uploadId, Throwable uploadError) {
+            boolean interrupted = Thread.interrupted();
+            try {
+                client.abortMultipartUpload(AbortMultipartUploadRequest.builder()
+                        .bucket(bucketName)
+                        .key(path)
+                        .uploadId(uploadId)
+                        .build());
+            } catch (RuntimeException abortError) {
+                log.warn(
+                        "Failed to abort multipart upload {} in bucket {} after the upload failed; its parts stay"
+                                + " stored until a lifecycle rule or a manual abort removes them",
+                        uploadId,
+                        bucketName,
+                        abortError);
+                uploadError.addSuppressed(abortError);
+            } finally {
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+
+        /**
+         * The base64 MD5 digest of the given range of the payload, for the Content-MD5 header that Object Lock enabled
+         * buckets require; null when MD5 is not available, in which case the upload goes without the header.
+         */
+        private static String contentMd5(byte[] payload, int offset, int length) {
+            try {
+                MessageDigest md5Digest = MessageDigest.getInstance("MD5");
+                md5Digest.update(payload, offset, length);
+                return Base64.getEncoder().encodeToString(md5Digest.digest());
+            } catch (NoSuchAlgorithmException e) {
+                log.warn(
+                        "Failed to calculate MD5 checksum for S3 upload. Object Lock enabled buckets may reject this upload.",
+                        e);
+                return null;
+            }
+        }
+
+        /**
+         * This method is supposed to provide help with any update required to template queries that are used to create
+         * the actual select, updated, insert etc. queries as part of the generate CRUD page feature. Any plugin that
+         * needs special handling should override this method. e.g. in case of the S3 plugin some special handling is
+         * required because (a) it uses UQI config form (b) it has concept of bucket instead of table.
+         */
+        @Override
+        public Mono<Void> sanitizeGenerateCRUDPageTemplateInfo(
+                List<ActionConfiguration> actionConfigurationList, Object... args) {
+            log.debug(Thread.currentThread().getName()
+                    + ": sanitizeGenerateCRUDPageTemplateInfo() called for AmazonS3 plugin.");
+            if (isEmpty(actionConfigurationList)) {
+                return Mono.empty();
+            }
+
+            /* Add mapping to replace template bucket name with user chosen bucket everywhere in the template */
+            Map<String, String> mappedColumnsAndTableName = (Map<String, String>) args[0];
+            final String userSelectedBucketName = (String) args[1];
+            Map<String, Object> formData = actionConfigurationList.get(0).getFormData();
+            mappedColumnsAndTableName.put(
+                    (String) ((Map<?, ?>) formData.get(KEY_BUCKET)).get(KEY_DATA), userSelectedBucketName);
+
+            return Mono.empty();
+        }
+    }
+}
